@@ -20,9 +20,17 @@ export default function useRealtimeBoats(onChange: (payload: RealtimePayload<Boa
           schema: 'daranee',
           table: 'boats',
         },
-        (payload) => {
+        (payload: any) => {
           console.log('[useRealtimeBoats] Received change:', payload);
-          onChange(payload as RealtimePayload<Boat>);
+          // Convert Supabase payload to our RealtimePayload type
+          const realtimePayload: RealtimePayload<Boat> = {
+            eventType: payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE',
+            schema: payload.schema,
+            table: payload.table,
+            new: payload.new,
+            old: payload.old,
+          };
+          onChange(realtimePayload);
         }
       )
       .subscribe((status) => {
