@@ -21,6 +21,7 @@ export default function LiffPage() {
   const [position, setPosition] = useState<MapCenter | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedBoat, setSelectedBoat] = useState<NearbyBoat | null>(null);
+  const [isClient, setIsClient] = useState(false);
 
   // Use new hook with object syntax
   const { boats, loading, error: boatsError, setBoats, refetch } = useNearbyBoats({
@@ -61,8 +62,15 @@ export default function LiffPage() {
 
   useRealtimeBoats(handleRealtime);
 
+  // Set client flag
+  useEffect(() => {
+    setIsClient(true);
+  }, []);
+
   // Initialize LIFF
   useEffect(() => {
+    if (!isClient) return;
+    
     const scriptId = 'liff-sdk';
     
     // ✅ Dev mode fallback: ถ้าไม่มี LIFF_ID หรือเปิดนอก LINE app
@@ -205,7 +213,7 @@ export default function LiffPage() {
     return () => {
       navigator.geolocation.clearWatch(watchId);
     };
-  }, [liffReady]);
+  }, [liffReady, isClient]);
 
   const handleBoatClick = useCallback((boat: NearbyBoat) => {
     setSelectedBoat(boat);
@@ -242,7 +250,7 @@ export default function LiffPage() {
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"/>
                     </svg>
-                    {!window.liff?.isInClient?.() && 'Dev Mode'}
+                    {isClient && typeof window !== 'undefined' && !window.liff?.isInClient?.() && 'Dev Mode'}
                   </>
                 )}
               </div>
