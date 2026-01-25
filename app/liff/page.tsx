@@ -23,7 +23,7 @@ export default function LiffPage() {
   const [selectedBoat, setSelectedBoat] = useState<NearbyBoat | null>(null);
 
   // Use new hook with object syntax
-  const { boats, loading, error: boatsError, setBoats } = useNearbyBoats({
+  const { boats, loading, error: boatsError, setBoats, refetch } = useNearbyBoats({
     lat: position?.lat ?? null,
     lon: position?.lon ?? null,
     radius_km: 5,
@@ -39,51 +39,44 @@ export default function LiffPage() {
 
     if (!newRow && !oldRow) return;
 
-    setBoats((current) => {
-      const map = new Map(current.map((b) => [b.id, b]));
-
-      if (eventType === 'DELETE') {
-        const id = oldRow?.id || newRow?.id;
-        if (id) {
-          map.delete(id);
-          console.log(`[LIFF] Boat ${id} deleted`);
-        }
-      } else if (newRow) {
-        // For INSERT or UPDATE
-        // Note: realtime payload doesn't include distance_m, 
-        // so we need to refetch or calculate it
-        const existingBoat = map.get(newRow.id);
-        
-        // Keep existing distance if available, otherwise set to 0
-        const updatedBoat: NearbyBoat = {
-          id: newRow.id,
-          name: newRow.name,
-          status: newRow.status,
-          boat_type: newRow.boat_type,
-          capacity: newRow.capacity,
-          price_per_hour: newRow.price_per_hour,
-          latitude: 0, // Will be calculated from location
-          longitude: 0,
-          updated_at: newRow.updated_at,
-          distance_m: existingBoat?.distance_m ?? 0,
-        };
-
-        // Extract coordinates from PostGIS geography if needed
-        // In practice, you might need to refetch from RPC to get accurate lat/lon
-        
-        map.set(newRow.id, updatedBoat);
-        console.log(`[LIFF] Boat ${newRow.id} ${eventType === 'INSERT' ? 'added' : 'updated'}`);
+    // ✅ แนะนำ: ไม่ update พิกัด (0,0) โดยตรง → trigger refetch แทน
+    // เพราะ realtime payload ไม่มี lat/lon จาก PostGIS geography
+    if (eventType === 'DELETE') {
+      // ลบเรือออกจาก list ทันที
+      const id = oldRow?.id || newRow?.id;
+      if (id) {
+        setBoats((current) => current.filter((b) => b.id !== id));
+        console.log(`[LIFF] Boat ${id} deleted`);
       }
-
-      return Array.from(map.values());
-    });
-  }, [setBoats]);
+    } else if (eventType === 'INSERT' || eventType === 'UPDATE') {
+      // สำหรับ INSERT/UPDATE → refetch เพื่อให้ได้พิกัดที่ถูกต้อง
+      console.log(`[LIFF] Boat ${eventType} detected - refetching nearby boats...`);
+      
+      // Debounce refetch เล็กน้อยเพื่อไม่ให้ยิงถี่เกิน
+      setTimeout(() => {
+        refetch();
+      }, 300);
+    }
+  }, [setBoats, refetch]);
 
   useRealtimeBoats(handleRealtime);
 
   // Initialize LIFF
   useEffect(() => {
     const scriptId = 'liff-sdk';
+    
+    // ✅ Dev mode fallback: ถ้าไม่มี LIFF_ID หรือเปิดนอก LINE app
+    const LIFF_ID = process.env.NEXT_PUBLIC_LIFF_ID || '';
+    
+    if (!LIFF_ID || LIFF_ID === 'your_liff_id') {
+      console.warn('[LIFF] LIFF_ID missing or not configured – running in DEV mode');
+      setLiffReady(true);
+      setError('⚠️ Dev Mode: ไม่ได้เชื่อมต่อกับ LINE (ใช้สำหรับทดสอบเท่านั้น)');
+      
+      // Use mock location for dev (Bangkok)
+      setPosition({ lat: 13.7563, lon: 100.5018 });
+      return;
+    }
     
     if (!document.getElementById(scriptId)) {
       const script = document.createElement('script');
@@ -97,8 +90,6 @@ export default function LiffPage() {
     }
 
     function initLiff() {
-      const LIFF_ID = process.env.NEXT_PUBLIC_LIFF_ID || '';
-      
       if (!window.liff) {
         setError('LIFF SDK ไม่สามารถโหลดได้');
         return;
@@ -108,6 +99,16 @@ export default function LiffPage() {
         .init({ liffId: LIFF_ID })
         .then(() => {
           console.log('[LIFF] Initialized successfully');
+          
+          // ✅ Check if running inside LINE app
+          if (!window.liff.isInClient()) {
+            console.warn('[LIFF] Not running in LINE app');
+            setError('⚠️ กรุณาเปิดใน LINE app เพื่อใช้งานเต็มรูปแบบ');
+            // Still allow usage for testing
+            setLiffReady(true);
+            return;
+          }
+          
           setLiffReady(true);
 
           // Get user profile
@@ -129,11 +130,14 @@ export default function LiffPage() {
         .catch((err: any) => {
           console.error('[LIFF] Init failed:', err);
           setError('LIFF เริ่มต้นไม่สำเร็จ: ' + String(err));
+          
+          // ✅ Fallback: ให้ใช้งานได้แม้ LIFF fail (dev-friendly)
+          setLiffReady(true);
         });
     }
   }, []);
 
-  // Watch user location
+  // Watch user location with debounce to prevent excessive API calls
   useEffect(() => {
     if (!liffReady) return;
 
@@ -142,12 +146,50 @@ export default function LiffPage() {
       return;
     }
 
+    let lastPosition: MapCenter | null = null;
+
+    // Helper function to calculate distance between two points (Haversine formula)
+    const calculateDistance = (pos1: MapCenter, pos2: MapCenter): number => {
+      const R = 6371000; // Earth's radius in meters
+      const lat1 = pos1.lat * Math.PI / 180;
+      const lat2 = pos2.lat * Math.PI / 180;
+      const deltaLat = (pos2.lat - pos1.lat) * Math.PI / 180;
+      const deltaLon = (pos2.lon - pos1.lon) * Math.PI / 180;
+
+      const a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+                Math.cos(lat1) * Math.cos(lat2) *
+                Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+      return R * c; // Distance in meters
+    };
+
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        setPosition({
+        const newPosition: MapCenter = {
           lat: pos.coords.latitude,
           lon: pos.coords.longitude,
-        });
+        };
+
+        // ✅ Debounce: อัปเดตเฉพาะเมื่อขยับมากกว่า 50 เมตร
+        // ป้องกัน watchPosition ยิงทุก 2-5 วิ → battery drain + API quota
+        if (!lastPosition) {
+          // First position - always update
+          setPosition(newPosition);
+          lastPosition = newPosition;
+          console.log('[LIFF] Initial position set');
+        } else {
+          const distance = calculateDistance(lastPosition, newPosition);
+          
+          // Update only if moved more than 50 meters
+          if (distance > 50) {
+            setPosition(newPosition);
+            lastPosition = newPosition;
+            console.log(`[LIFF] Position updated (moved ${distance.toFixed(0)}m)`);
+          } else {
+            console.log(`[LIFF] Position change ignored (only ${distance.toFixed(0)}m)`);
+          }
+        }
       },
       (err) => {
         console.error('[LIFF] Geolocation error:', err);
@@ -181,48 +223,50 @@ export default function LiffPage() {
         borderBottom: '1px solid #eee'
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>🚢 ดารณี - Boat Finder</div>
-            <div style={{ fontSize: 11, color: '#999' }}>
-              {lineUserId ? `👤 ${lineUserId.substring(0, 8)}...` : '👤 ไม่ได้เข้าสู่ระบบ'}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 18h18M3 18l3-9h12l3 9M6 18v-2M18 18v-2M12 9V3M8 5h8"/>
+            </svg>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 16 }}>ดารณี - Boat Finder</div>
+              <div style={{ fontSize: 11, color: '#999', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                {lineUserId ? (
+                  <>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/>
+                    </svg>
+                    {lineUserId.substring(0, 8)}...
+                  </>
+                ) : (
+                  <>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"/>
+                    </svg>
+                    {!window.liff?.isInClient?.() && 'Dev Mode'}
+                  </>
+                )}
+              </div>
             </div>
           </div>
           {position && (
-            <div style={{ fontSize: 11, color: '#666', textAlign: 'right' }}>
-              📍 {position.lat.toFixed(4)}, {position.lon.toFixed(4)}
+            <div style={{ fontSize: 11, color: '#666', textAlign: 'right', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+              </svg>
+              {position.lat.toFixed(4)}, {position.lon.toFixed(4)}
             </div>
           )}
         </div>
       </header>
 
-      {/* Error Banner */}
-      {error && (
-        <div style={{ 
-          padding: '8px 16px', 
-          background: '#fee', 
-          color: '#c33', 
-          fontSize: 13,
-          borderBottom: '1px solid #fcc'
-        }}>
-          ⚠️ {error}
-        </div>
-      )}
-
-      {boatsError && (
-        <div style={{ 
-          padding: '8px 16px', 
-          background: '#ffc', 
-          color: '#880', 
-          fontSize: 13,
-          borderBottom: '1px solid #dd8'
-        }}>
-          ⚠️ ไม่สามารถโหลดข้อมูลเรือ: {boatsError}
-        </div>
-      )}
-
       {/* Main Content - Map */}
       <main style={{ flex: 1, position: 'relative' }}>
-        <LeafletMap center={position} boats={boats} onBoatClick={handleBoatClick} />
+        <LeafletMap 
+          center={position} 
+          boats={boats} 
+          onBoatClick={handleBoatClick}
+          selectedBoat={selectedBoat}
+        />
 
         {/* Boat List Sidebar */}
         <aside style={{ 
@@ -244,11 +288,33 @@ export default function LiffPage() {
             background: '#f8f9fa',
             borderRadius: '12px 12px 0 0'
           }}>
-            <div style={{ fontWeight: 700, fontSize: 15 }}>🚢 เรือใกล้เคียง</div>
-            <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
-              {loading ? '🔄 กำลังโหลด...' : `พบ ${boats.length} ลำ`}
+            <div style={{ fontWeight: 700, fontSize: 15, display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M3 18h18M3 18l3-9h12l3 9M6 18v-2M18 18v-2M12 9V3M8 5h8"/>
+              </svg>
+              เรือใกล้เคียง
+            </div>
+            <div style={{ fontSize: 12, color: '#666', marginTop: 4, display: 'flex', alignItems: 'center', gap: '4px' }}>
+              {loading ? (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                  กำลังโหลด...
+                </>
+              ) : boatsError ? (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#e74c3c" strokeWidth="2">
+                    <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                  </svg>
+                  <span style={{ color: '#e74c3c' }}>ไม่สามารถโหลดข้อมูล</span>
+                </>
+              ) : (
+                `พบ ${boats.length} ลำ`
+              )}
             </div>
           </div>
+          <style dangerouslySetInnerHTML={{ __html: '@keyframes spin { to { transform: rotate(360deg); } }' }} />
 
           <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
             {boats.length === 0 && !loading && (
@@ -274,20 +340,44 @@ export default function LiffPage() {
                       {boat.name}
                     </div>
                     <div style={{ fontSize: 12, color: '#666', lineHeight: 1.5 }}>
-                      <div>ประเภท: {boat.boat_type}</div>
-                      <div>สถานะ: <span style={{ 
-                        fontWeight: 600,
-                        color: boat.status === 'available' ? '#2ecc71' : 
-                               boat.status === 'busy' ? '#e74c3c' : 
-                               boat.status === 'booked' ? '#f1c40f' : '#95a5a6'
-                      }}>
-                        {boat.status === 'available' ? 'ว่าง' :
-                         boat.status === 'busy' ? 'ไม่ว่าง' :
-                         boat.status === 'booked' ? 'จองแล้ว' : 'ซ่อม'}
-                      </span></div>
-                      <div>ที่นั่ง: {boat.capacity} คน</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 18h18M3 18l3-9h12l3 9"/>
+                        </svg>
+                        {boat.boat_type}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill={
+                          boat.status === 'available' ? '#2ecc71' : 
+                          boat.status === 'busy' ? '#e74c3c' : 
+                          boat.status === 'booked' ? '#f1c40f' : '#95a5a6'
+                        }>
+                          <circle cx="12" cy="12" r="10"/>
+                        </svg>
+                        <span style={{ 
+                          fontWeight: 600,
+                          color: boat.status === 'available' ? '#2ecc71' : 
+                                 boat.status === 'busy' ? '#e74c3c' : 
+                                 boat.status === 'booked' ? '#f1c40f' : '#95a5a6'
+                        }}>
+                          {boat.status === 'available' ? 'ว่าง' :
+                           boat.status === 'busy' ? 'ไม่ว่าง' :
+                           boat.status === 'booked' ? 'จองแล้ว' : 'ซ่อม'}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+                        </svg>
+                        {boat.capacity} คน
+                      </div>
                       {boat.price_per_hour && (
-                        <div>ราคา: ฿{boat.price_per_hour.toFixed(0)}/ชม.</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+                          </svg>
+                          {boat.price_per_hour.toFixed(0)}/ชม.
+                        </div>
                       )}
                     </div>
                   </div>

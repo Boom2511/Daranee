@@ -50,11 +50,15 @@ export default function useNearbyBoats(
         boat_status: queryStatus,
       };
 
-      const { data, error: rpcError } = await supabase.rpc('find_nearby_boats', rpcParams);
+      // ✅ Call RPC function in daranee schema
+      const { data, error: rpcError } = await supabase
+        .schema('daranee')
+        .rpc('find_nearby_boats', rpcParams);
 
       if (rpcError) throw rpcError;
 
       setBoats((data as NearbyBoat[]) || []);
+      console.log(`[useNearbyBoats] Found ${data?.length || 0} boats`);
     } catch (err: any) {
       console.error('[useNearbyBoats] Error:', err);
       setError(err.message || String(err));
